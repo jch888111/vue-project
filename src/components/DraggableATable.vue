@@ -12,8 +12,20 @@
 import { computed, h, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef, useAttrs, useSlots, watch } from 'vue';
 import { HolderOutlined } from '@ant-design/icons-vue';
 import { useDraggable } from 'vue-draggable-plus';
+import {
+    DEFAULT_FIXED_BEHAVIOR,
+    DEFAULT_VISIBLE_FIELD,
+    filterVisibleColumns,
+    getColumnKey as resolveColumnKey,
+    isLockedColumn,
+    normalizeColumnsForTable,
+    serializeColumnsForApi,
+    sortColumnsWithHiddenFollowers,
+    splitColumns,
+} from './tableColumnUtils';
 
 defineOptions({
+    name: 'DraggableATable',
     inheritAttrs: false,
 });
 
@@ -21,6 +33,31 @@ const props = defineProps({
     columns: {
         type: Array,
         default: () => [],
+    },
+    visibleField: {
+        type: String,
+        default: DEFAULT_VISIBLE_FIELD,
+    },
+    columnKeyField: {
+        type: [String, Function],
+        default: '',
+    },
+    draggable: {
+        type: Boolean,
+        default: true,
+    },
+    resizable: {
+        type: Boolean,
+        default: true,
+    },
+    fixedBehavior: {
+        type: String,
+        default: DEFAULT_FIXED_BEHAVIOR,
+        validator: value => ['normalize', 'none'].includes(value),
+    },
+    stopHeaderSlotEvents: {
+        type: Boolean,
+        default: true,
     },
 });
 
@@ -34,45 +71,16 @@ const originColumnMeta = new WeakMap();
 
 const DRAG_HANDLE_CLASS = 'draggable-a-table__drag-handle';
 
-const getColumnKey = (column, index) => {
-    if (column?.key != null) return String(column.key);
+const columnOptions = computed(() => ({
+    columnKeyField: props.columnKeyField,
+    fixedBehavior: props.fixedBehavior,
+    visibleField: props.visibleField,
+}));
 
-    const dataIndex = column?.dataIndex;
-    if (Array.isArray(dataIndex)) return dataIndex.join('.');
-    if (dataIndex != null) return String(dataIndex);
+const getColumnKey = (column, index) => resolveColumnKey(column, index, columnOptions.value);
 
-    return `column-${index}`;
-};
-
-const isLeftFixedColumn = column => column?.fixed === true || column?.fixed === 'left';
-const isRightFixedColumn = column => column?.fixed === 'right';
-const isLockedColumn = column => isLeftFixedColumn(column) || isRightFixedColumn(column);
-const isResizableColumn = column => column?.resizable && typeof column?.width === 'number';
-
-const splitColumns = columns => {
-    return columns.reduce(
-        (result, column, index) => {
-            const item = {
-                column,
-                key: getColumnKey(column, index),
-            };
-
-            if (isLeftFixedColumn(column)) {
-                result.left.push(item);
-            } else if (isRightFixedColumn(column)) {
-                result.right.push(item);
-            } else {
-                result.middle.push(item);
-            }
-
-            return result;
-        },
-        {
-            left: [],
-            middle: [],
-            right: [],
-        },
-    );
+const shouldEnableResize = column => {
+    return props.resizable && column?.resizable !== false && typeof column?.width === 'number';
 };
 
 const mergeClass = (sourceClass, addedClass) => {
@@ -108,6 +116,28 @@ const forwardedSlots = computed(() => {
     return restSlots;
 });
 
+const stopHeaderSlotEvent = event => {
+    event.stopPropagation();
+};
+
+const wrapHeaderSlotContent = content => {
+    if (!props.stopHeaderSlotEvents) return content;
+
+    const children = Array.isArray(content) ? content : [content];
+
+    return h(
+        'div',
+        {
+            class: 'draggable-a-table__header-slot',
+            onClick: stopHeaderSlotEvent,
+            onMousedown: stopHeaderSlotEvent,
+            onPointerdown: stopHeaderSlotEvent,
+            onTouchstart: stopHeaderSlotEvent,
+        },
+        children,
+    );
+};
+
 const getDraggableHeaderCell = (column, index, originCustomHeaderCell) => {
     const key = getColumnKey(column, index);
 
@@ -127,11 +157,11 @@ const renderColumnTitle = (column, titleProps) => {
     const originTitle = getOriginColumnMeta(column).title;
 
     if (slots.headerCell) {
-        return slots.headerCell({
+        return wrapHeaderSlotContent(slots.headerCell({
             ...titleProps,
             title: originTitle,
             column: toExternalColumn(column),
-        });
+        }));
     }
 
     if (typeof originTitle === 'function') return originTitle(titleProps);
@@ -185,11 +215,11 @@ const prepareColumns = columns => {
 
         originColumnMeta.set(nextColumn, originMeta);
 
-        if (isResizableColumn(nextColumn)) {
+        if (shouldEnableResize(nextColumn)) {
             nextColumn.resizable = true;
         }
 
-        if (!isLockedColumn(nextColumn)) {
+        if (props.draggable && !isLockedColumn(nextColumn)) {
             nextColumn.title = getDraggableTitle(nextColumn);
             nextColumn.customHeaderCell = getDraggableHeaderCell(nextColumn, index, originMeta.customHeaderCell);
         } else if (slots.headerCell) {
@@ -200,29 +230,27 @@ const prepareColumns = columns => {
     });
 };
 
-const normalizeColumnsForTable = columns => {
-    const { left, middle, right } = splitColumns(columns);
-
-    return [
-        ...left.map(item => item.column),
-        ...middle.map(item => item.column),
-        ...right.map(item => item.column),
-    ];
-};
-
 const visibleColumns = computed(() => {
-    return orderedColumns.value.filter(column => column.visible !== false);
+    return filterVisibleColumns(orderedColumns.value, props.visibleField);
 });
 
-const tableColumns = computed(() => prepareColumns(normalizeColumnsForTable(visibleColumns.value)));
+const normalizedVisibleColumns = computed(() => {
+    return normalizeColumnsForTable(visibleColumns.value, columnOptions.value);
+});
+
+const tableColumns = computed(() => prepareColumns(normalizedVisibleColumns.value));
+
+const normalizeColumns = columns => {
+    return normalizeColumnsForTable(columns, columnOptions.value);
+};
 
 const syncColumnsFromProps = () => {
-    orderedColumns.value = normalizeColumnsForTable(props.columns);
+    orderedColumns.value = normalizeColumns(props.columns);
 };
 
 const findHeaderRow = () => {
     const wrapper = tableWrapper.value;
-    if (!wrapper) return null;
+    if (!wrapper || !props.draggable) return null;
 
     const rows = Array.from(wrapper.querySelectorAll('.ant-table-thead > tr'));
     return rows.find(row => row.querySelector('[data-draggable-column="true"]')) || null;
@@ -242,64 +270,56 @@ const emitColumnsUpdate = columns => {
     emit('update:columns', toExternalColumns(columns));
 };
 
-const sortColumnsWithHiddenFollowers = (items, orderedVisibleKeys) => {
-    const leadingHiddenColumns = [];
-    const groups = [];
-    let currentGroup = null;
+const reorderNonFixedColumnsInPlace = (columns, orderedVisibleKeys) => {
+    const result = [];
+    let segment = [];
 
-    items.forEach(item => {
-        if (item.column.visible === false) {
-            if (currentGroup) {
-                currentGroup.columns.push(item.column);
-            } else {
-                leadingHiddenColumns.push(item.column);
-            }
+    const flushSegment = () => {
+        if (!segment.length) return;
+
+        result.push(...sortColumnsWithHiddenFollowers(segment, orderedVisibleKeys, columnOptions.value));
+        segment = [];
+    };
+
+    columns.forEach((column, index) => {
+        if (isLockedColumn(column)) {
+            flushSegment();
+            result.push(column);
             return;
         }
 
-        currentGroup = {
-            key: item.key,
-            columns: [item.column],
-        };
-        groups.push(currentGroup);
+        segment.push({
+            column,
+            key: getColumnKey(column, index),
+        });
     });
 
-    const groupByKey = new Map(groups.map(group => [group.key, group]));
-    const usedKeys = new Set();
-    const sortedGroups = [];
+    flushSegment();
 
-    orderedVisibleKeys.forEach(key => {
-        if (!groupByKey.has(key) || usedKeys.has(key)) return;
-
-        usedKeys.add(key);
-        sortedGroups.push(groupByKey.get(key));
-    });
-
-    groups.forEach(group => {
-        if (usedKeys.has(group.key)) return;
-        sortedGroups.push(group);
-    });
-
-    return [
-        ...leadingHiddenColumns,
-        ...sortedGroups.flatMap(group => group.columns),
-    ];
+    return result;
 };
 
 const applyDomColumnOrder = target => {
-    const { left, middle, right } = splitColumns(orderedColumns.value);
+    if (!props.draggable) return;
 
     const domKeys = Array.from(target.querySelectorAll('[data-draggable-column="true"]'))
         .map(element => element.dataset.columnKey)
         .filter(Boolean);
 
-    const mergedMiddle = sortColumnsWithHiddenFollowers(middle, domKeys);
+    let nextColumns;
 
-    const nextColumns = [
-        ...left.map(item => item.column),
-        ...mergedMiddle,
-        ...right.map(item => item.column),
-    ];
+    if (props.fixedBehavior === 'none') {
+        nextColumns = reorderNonFixedColumnsInPlace(orderedColumns.value, domKeys);
+    } else {
+        const { left, middle, right } = splitColumns(orderedColumns.value, columnOptions.value);
+        const mergedMiddle = sortColumnsWithHiddenFollowers(middle, domKeys, columnOptions.value);
+
+        nextColumns = [
+            ...left.map(item => item.column),
+            ...mergedMiddle,
+            ...right.map(item => item.column),
+        ];
+    }
 
     orderedColumns.value = nextColumns;
     emitColumnsUpdate(nextColumns);
@@ -307,6 +327,8 @@ const applyDomColumnOrder = target => {
 };
 
 const handleResizeColumn = (width, column) => {
+    if (!props.resizable) return;
+
     column.width = width;
 
     const resizedColumnKey = getColumnKey(column);
@@ -325,7 +347,7 @@ const handleResizeColumn = (width, column) => {
     });
 };
 
-const draggable = useDraggable(null, {
+const draggableController = useDraggable(null, {
     immediate: false,
     animation: 150,
     direction: 'horizontal',
@@ -343,11 +365,26 @@ const draggable = useDraggable(null, {
 const refreshDraggable = async () => {
     await nextTick();
 
+    if (!props.draggable) {
+        draggableController.pause?.();
+        return;
+    }
+
     const headerRow = findHeaderRow();
     if (!headerRow) return;
 
-    draggable.start(headerRow);
+    draggableController.start(headerRow);
 };
+
+const getColumns = () => toExternalColumns(orderedColumns.value);
+const getVisibleColumns = () => toExternalColumns(normalizedVisibleColumns.value);
+
+defineExpose({
+    getColumns,
+    getVisibleColumns,
+    normalizeColumns,
+    serializeColumnsForApi: columns => serializeColumnsForApi(columns ?? orderedColumns.value, columnOptions.value),
+});
 
 watch(
     () => props.columns,
@@ -361,14 +398,18 @@ watch(
     },
 );
 
-watch(tableColumns, refreshDraggable, {
-    flush: 'post',
-});
+watch(
+    () => [tableColumns.value, props.draggable],
+    refreshDraggable,
+    {
+        flush: 'post',
+    },
+);
 
 onMounted(refreshDraggable);
 
 onBeforeUnmount(() => {
-    draggable.destroy();
+    draggableController.destroy();
 });
 </script>
 
@@ -379,23 +420,31 @@ onBeforeUnmount(() => {
 
 .draggable-a-table :deep(.ant-table-thead > tr > th) {
     height: auto;
-    padding: 12px;
+    width: 100%;
+    padding: 12px 24px;
     vertical-align: top;
 }
 
+.draggable-a-table :deep(.ant-table-tbody > tr > td) {
+    padding: 12px 24px;
+}
+
 .draggable-a-table :deep(.draggable-a-table__title) {
-    display: flex;
-    gap: 6px;
+    position: relative;
+    display: block;
+    width: 100%;
 }
 
 .draggable-a-table :deep(.draggable-a-table__drag-handle) {
+    position: absolute;
+    top: 2px;
+    left: -20px;
+    z-index: 1;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    flex: 0 0 auto;
     width: 16px;
     height: 16px;
-    margin-top: 2px;
     color: rgba(0, 0, 0, 0.45);
     cursor: grab;
     opacity: 0;
@@ -417,7 +466,13 @@ onBeforeUnmount(() => {
 
 .draggable-a-table :deep(.draggable-a-table__title-text) {
     min-width: 0;
+    width: 100%;
     line-height: 20px;
+}
+
+.draggable-a-table :deep(.draggable-a-table__header-slot) {
+    width: 100%;
+    min-width: 0;
 }
 
 .draggable-a-table :deep(.draggable-a-table__chosen) {
